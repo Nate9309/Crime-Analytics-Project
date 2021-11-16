@@ -1,0 +1,591 @@
+---
+title: "The relationship between non-profits and municipal spending on police protection"
+author: "Nathan Duma"
+date: "5/8/2021"
+output:
+  html_document:
+    theme: cerulean
+    highlight: textmate
+    fontsize: 8pt
+    toc: yes
+    number_sections: yes
+    code_download: yes
+    toc_float:
+      collapsed: no
+    includes:
+      in_header: header.html
+  output:
+  pdf_document:
+    toc: yes
+---
+
+# Introduction
+
+This notebook shows all data cleaning, data management and transformation steps, as well as all analyses and all graphics, including the code that was used to perform all of the above. I preform the data cleaning procedures (from start to finish) required to go from the raw data to the final *ready for analysis* dataset.  I also show the graphics that made it into the final paper along with the summary statistics and regression tables. This document is intended as a supplement to the paper.
+
+
+# Data Cleaning
+
+My project draws from three data sources: The first is Non-Profit data from the [*National Center*
+*for Charitable Statistics (NCCS)*](https://nccs-data.urban.org/index.php); The second is city level Crime data from an [American Sociological Review article](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/46WIH0) by Sharkey, Torrats-Espinosa, and Takyar (2017); The final data source is the [Fiscally Standardized Cities Database](https://www.lincolninst.edu/research-data/data-toolkits/fiscally-standardized-cities/search-database) which shows municipal spending on various budgetary categories.
+
+**I will perform the following tasks:**
+
+1. **NCCS Data:** Calculate the number of non-profits in a given category for each city-year.
+2. **Sharkey Crime Data:** Subset to remove variables we don't need and create balanced panel.
+3. **Fiscal Data:** Subset to keep only years between 1990 - 2012. Drop varibales we don't need.
+4. Merge all three datasets.
+
+
+```{r SetUp, echo = TRUE, results = "hide", message = FALSE}
+rm(list = ls())
+pkgs <- c("readr", "dplyr", "readstata13", "stringr")
+sapply(pkgs, library, character.only = TRUE, quietly = TRUE)
+
+```
+
+
+## Non-Profits Data (NCCS)
+
+In this section we use data on Non-Profit organizations released annually by the National Center for Charitable Statistics (NCCS), a part of the Center on Non-Profits and Philanthropy at the Urban Institute. This data is based of tax reporting data these Non-Profits make to the Internal Revenue Service (IRS). Specifically, we use data from the Cumulative Master File (CMF) which has data on all organizations that have tax exempt status with the IRS.
+
+The Sharkey et al paper already provides us with data on the number of crime focused Non-Profits in each city. All we need is the number of environment focused Non-Profits. Following Sharkey et al we limit our data to 501(c)3 organizations.
+
+
+The Cumulative Master File is very large (about 1.5GB) so we used the `readr` package which has functions optimized for quickly loading and querying large files in R. The data dictionary for the NCCS data can be found [here](https://nccs-data.urban.org/dd2.php?close=1&form=Current+Master+Ntee+Lookup+(April+2009)).
+
+```{r Load NCCS, echo = TRUE, results = "hide", message = FALSE}
+masterData <- read_delim("../Non Profit Data/nccs.nteedocAllEins.csv", ",", col_names = TRUE) # Current Master NTEE Lookup
+
+crimeData <- read.dta13("../crime-nonprofits-panel.dta") # you'll need this before the Sharkey section (keep it here)
+
+```
+
+
+
+Lets start by subsetting and dropping portions of the data we don't need.
+* The Non-Profits that NCCS has flagged as *out of scope*. There can be many reasons why a non-profit is flagged e.g. missing geographical info, Not a 501(c)3.
+* Non-Profits not active during our sample period i.e those whose last taxes were filed before 1990 (the year our study starts).
+* Non-Profits that are not 501(c)3
+
+
+```{r Drop NCCS}
+# drop flagged non-profits
+masterData <- subset(masterData, OutNccs == "IN")
+
+# drop non-profits not active in sample period 1990 - 2012
+masterData <- subset(masterData, UpdateFisYr >= 1990)
+
+# drop non-501(c)3 non-profits
+masterData <- subset(masterData, SubsecCd == "03")
+
+# Subset based on Ntee Code classification rating A/B/C
+masterData <- subset(masterData, nteeConfCO %in% c("A", "B", "C"))
+
+```
+
+
+Rule data is the date when the org got tax exempt status from the IRS. We can use it as a proxy for when the org was founded. The current variable is a string in the form YYYYMM. We need to convert it to YYYY.
+
+```{r Fix Ruke Date}
+masterData$RuleDate <- substr(masterData$RuleDate, start = 1, stop = 4)
+masterData$RuleDate <- as.numeric(masterData$RuleDate)
+masterData <- subset(masterData, RuleDate != 0)
+
+```
+
+Next we can classify the Non-Profits by sector using the [NTEE/IRS Activity Codes](https://nccs.urban.org/publication/irs-activity-codes). I'm primarily interested in the Environmental Non-Profits but I also collect data for Animal Welfare, Crime, Housing and Disaster Preparedness non-profits just in case I find a use for those values.
+
+* **C:** Environment - Private nonprofit organizations whose primary purpose is to preserve, protect and improve the environment.
+* **D:** Animal-Related	Private nonprofit organizations whose primary purpose is to provide for the care, protection and control of wildlife and domestic animals that are a part of the living environment; to help people develop an understanding of their pets; and to train animals for purposes of showing.
+* **I:** Crime and Legal Related
+* **L:** Housing & Shelter
+* **M:** Public Safety, Disaster Preparedness & Relief
+
+```{r NTEE Codes}
+nteeCodes <- c("C", "D", "I", "L", "M")
+nteeDescA <- c("envmt_new", 'animal_new', "crime_new", "housing_new", "disaster_new") # var names new charities
+nteeDescB <- c("envmt_cml", 'animal_cml', "crime_cml", "housing_cml", "disaster_cml") # var names cumulative no.
+
+masterData$NteeFinal <- substr(masterData$NteeFinal, start = 1, stop = 1) # keep only first letter of classification
+masterData <- subset(masterData, NteeFinal %in% nteeCodes)
+```
+
+
+### Number of New Non-Profits Each Year
+
+
+It's easier to calculate the number of new non-profits in each given city-year for each sector, so we'll start with that. To make sure I'm getting the same cities in the Sharkey et al dataset I'll load it in now and keep only cities that are in that dataset.
+
+```{r Find Cities}
+suffix <- c(" (balance)"," city", "town", " municipality")
+for(elem in suffix){
+  # remove suffixes from city names
+  crimeData$place_name <- gsub(elem, "", crimeData$place_name)
+}
+
+# matching variable for cities
+crimeData$matchCity <- paste(crimeData$state_ab, crimeData$place_name, sep = ": ")
+# View(crimeData[,c(1:7,292)]) # check correctness
+
+```
+
+
+
+
+
+```{r New NonProfits}
+# Capitalize the first letter of each word
+masterData$City <- stringr::str_to_title(masterData$City)
+# matching variable for cities
+masterData$matchCity <- paste(masterData$State, masterData$City, sep = ": ")
+length(unique(masterData$matchCity)) # 20,984 unique cities/towns
+sum(unique(masterData$matchCity) %in% crimeData$matchCity) # 259 cities from the non-profit dataset are also in the crime dataset
+
+# Now subset to keep only those cities
+masterData <- subset(masterData, matchCity %in% crimeData$matchCity)
+
+
+newCharities <- masterData %>% filter(RuleDate %in% 1990:2012) %>%
+  group_by(matchCity, RuleDate, NteeFinal) %>%
+  count()
+
+# assign charity category names
+newCharities$category <- NA
+
+for(j in 1:length(nteeCodes)){
+  # recoding to full category names
+  newCharities$category <- ifelse(newCharities$NteeFinal == nteeCodes[j], nteeDescA[j], newCharities$category)
+}
+
+
+head(newCharities)
+```
+
+
+Next we'll need to reshape the resulting dataframe to make the categories columns.
+
+```{r Reshape New Charities}
+newCharities <- newCharities[,c(1,2,5,4)]
+newCharities <- reshape::cast(newCharities, matchCity+RuleDate~category)
+newCharities[,3:7] <- sapply(newCharities[,3:7], function(x) ifelse(is.na(x), 0, x)) # replace NA's with zeros
+cat("This is what the variables for number of new charities in each year look like\n")
+head(newCharities)
+```
+
+
+
+### Cumulative Number of Non-Profits in each Year
+
+Here we assume that a charity is active from the time it gains tax exempt status (`RuleDate`) until the year of its last tax return (`UpdateFisYr`). This part is much more involved, the code works but is unspeakably slow.
+
+
+```{r}
+yearRange <- 1990:2016
+
+
+for(elem in yearRange){masterData[[paste("In", elem, sep = "_")]] <- NA} # create year dummy variables
+# View(masterData[,c(2,4,5,20,15,63,118:144)])
+masterData[, c(118:144)] <- sapply(masterData[, c(118:144)], FUN = as.numeric) # convert from boolean to numeric
+
+dummyColumns <- names(masterData)[118:144]
+
+
+for(row in 1:nrow(masterData)){
+  # iterate over the rows of the dataset
+  for(col in 1: length(yearRange)){
+    # find if a given charity existed in a given year, code the dummy for that yr as 1 otherwise zero
+    masterData[row, dummyColumns[col]] <- ifelse(yearRange[col] %in% masterData$RuleDate[row] : masterData$UpdateFisYr[row], 1, 0)
+  }
+}
+
+
+# View(masterData[,c(2,4,5,20, 15,63,118:144)]) # check if it worked
+
+head(masterData[,c(1,4,5,20,15,63,118:144)])
+
+```
+
+
+Now we can just sum up the dummy columns to find out the cumulative number of charities in a given year.
+
+```{r Cuml Charities}
+
+cumlCharities <- masterData %>% filter(RuleDate <= 2012) %>%
+  group_by(matchCity, NteeFinal) %>%
+  select(In_1990:In_2012) %>%
+  summarise(across(everything(), function(x) sum(x, na.rm = T)))
+
+
+# assign charity category names
+cumlCharities$category <- NA
+
+for(j in 1:length(nteeCodes)){
+  # recoding to full category names
+  cumlCharities$category <- ifelse(cumlCharities$NteeFinal == nteeCodes[j], nteeDescB[j], cumlCharities$category)
+}
+
+# View(cumlCharities[,c(1,2,26)]) # it worked
+
+cumlCharitiesBackup <- cumlCharities
+cumlCharities <- as.data.frame(cumlCharities)
+
+cumlCharities <- reshape::melt(cumlCharities[,-2], id = c("matchCity", "category"))
+cumlCharities$variable <- as.character(cumlCharities$variable)
+cumlCharities$variable <- as.numeric(gsub("In_", "", cumlCharities$variable))
+cumlCharities <- reshape::cast(cumlCharities, matchCity + variable ~ category)
+
+allCharities <- merge(cumlCharities, newCharities, by.x = c("matchCity", "variable"), by.y = c("matchCity", "RuleDate"), all.x = TRUE)
+
+allCharities[,c(8:12)] <- sapply(allCharities[,c(8:12)], FUN = function(x) ifelse(is.na(x), 0, x)) # replace NAs with zeros
+```
+
+
+**The final output for the number of non-profit variables looks like this**
+
+```{r echo=FALSE}
+head(allCharities)
+rm(cumlCharities, cumlCharitiesBackup, newCharities)
+write.csv(allCharities, file = "Number of Non-Profits (all conf levels).csv", row.names = F, quote = T)
+```
+
+
+
+## Crime Data
+
+We've already loaded in the crime data. All we need to do with this data is to subset it keeping only the variables we care about.
+
+
+```{r Subset Crime}
+crimeData <- crimeData[,c(292,1:104)]
+head(crimeData[,c(1,3,5,21,23,40,41)])
+
+```
+
+
+
+## Fiscal Data
+
+In this section we load in clean and subset the city-level spending data from the Fiscally Standardized Cities Database.
+
+
+```{r Fisc Load}
+fiscalData <- readxl::read_xlsx("../fisc_full_dataset_2017_update.xlsx", sheet = "Data")
+fiscalData <- fiscalData[,c(1:3,5,7:14,76,80:82)]
+fiscalData <- subset(fiscalData, year %in% 1990:2012) # subset to sample period
+head(fiscalData[,c(1,2,5,6,13,14)])
+```
+
+## Merging the Datasets
+
+The last part of the data cleaning is to merge all the datasets. The fiscal data has the lowest number of cities so the max number of cities in our final data is 218.
+
+We start of by checking how well the cities between the two datasets match.
+
+```{r}
+sum(unique(fiscalData$city_name) %in% unique(allCharities$matchCity)) # 121 cities in both the fiscal & charities data
+
+# find the unmatched cities
+unmatched <- which(!unique(fiscalData$city_name) %in% unique(allCharities$matchCity))
+
+cat("Number of Unmatched cities\n")
+length(unmatched)
+
+# cat("A list of currently unmatched cities \n")
+# unique(fiscalData$city_name)[unmatched]
+```
+
+
+There are lots of currently unmatched cities because of small differences in the naming conventions. A lot of this can be recovered latter. As we currently stand our final dataset will have 121 cities but that can be expanded to 150.
+
+```{r Merging}
+xMerge <- merge(allCharities, crimeData, by.x = c("matchCity", "variable"), by.y = c("matchCity", "year"), all.x = TRUE)
+
+fiscalData <- subset(fiscalData, city_name %in% xMerge$matchCity)
+
+yMerge <- merge(fiscalData, xMerge, by.x = c("city_name", "year"), by.y = c("matchCity", "variable"), all.x = TRUE)
+```
+
+
+Finally, we write and output our final dataset. It has 121 cities just like we expected.
+
+```{r Write Output}
+length(unique(yMerge$city_name)) # 121 cities
+
+write.csv(yMerge, file = "FinalData.csv", row.names = F, quote = T)
+
+```
+
+
+
+
+# Visualization
+
+
+In Exercise 4 of the class I created a number of visualizations. Only one of these made it into the paper.
+The plot is a heatmap that shows the correlation between the most important variables for the study. I used the `pheatmap` and `RColorBrewer` packages. The later is for selecting attractive color palettes.
+
+
+
+```{r Viz Setup}
+
+library(pheatmap)
+library(RColorBrewer)
+library(pdftools)
+
+finalData <- read.csv("FinalData.csv")
+rm(list = ls()[! ls() %in% "finalData"]) # remove everything except the finalData
+
+```
+
+
+**We start by preparing the data for the plot**
+
+```{r Prep Plot Data}
+# prep plot data
+keepVars <- c("police_city","rev_total_city", "totpop", "crime_cml_r", "viol_r", "prop_r", "poverty", "fborn", "unemployed_male")
+
+corData <- subset(finalData, select = keepVars)
+
+names(corData) <- c("Police Spending", "Total Revenue", "Population", "Cuml Crime Charities", "Violent Crime Rate", "Property Crime Rate", "% in Poverty", "% Foreign Born", "Unemployment Rate (male)")
+
+corData <- cor(corData, use = "complete")
+```
+
+
+**Next, we create the plot itself.**
+
+```{r Heatmap, eval = FALSE}
+# begin plot
+pdf_file <- "correlation_heatmap.pdf"
+
+cairo_pdf(bg = "grey98", pdf_file, width = 7,height = 6)
+par(mai = c(0.25, 0.25, 0.25, 1.75), omi = c(0.25,0.25,0.75,0.85), family = "Lato Light", las = 1)
+
+
+# Create chart
+plot.new()
+
+pheatmap(corData, col = brewer.pal(6,"RdPu"), cluster_rows = F, cluster_cols = F, cellwidth = 35, cellheight = 24,
+         border_color="white", fontfamily = "Lato Light", display_numbers = T, number_color = matrix(ifelse(corData > 0.5, "white", "red"), nrow(corData)))
+
+
+# Titling
+# mtext(expression(bold("Variable Correlation Plot 1990-2012")), 3, line = 1.5, adj = 0, cex = 1.75, outer=T)
+mtext("Variable Correlation Plot 1990-2012", 3, line = 1.5, adj = 0, cex = 1.75, family = "Lato Black", outer=T)
+
+par(family = "Lato Black")
+mtext("\u2199", 1, line = -7,adj = 0.9, cex = 7, col = "grey80", outer = T)
+dev.off()
+
+```
+
+
+
+```{r echo=FALSE, fig.width=7, fig.height = 8}
+if(! file.exists("correlation_heatmap.png")){pdftools::pdf_convert("correlation_heatmap.pdf", format = "png", dpi = 300, filenames = "correlation_heatmap.png")}
+
+knitr::include_graphics("correlation_heatmap.png")
+```
+
+
+# Summary Statistics
+
+
+Before moving on to the analysis, I first show the summary statistics. In the paper, these appear in `Table 2`.
+
+We start by removing cities with missing and anomalous values (e.g. police spending value of zero).
+
+```{r Missing Data}
+panelData <- finalData[,c(1,2,31,5, 13,45,47,49,51,53,55,57,59,61,64,65,84,85,99:103,105:108,110,115,116,119,123,124,125,128,129)]
+incompleteCities <- unique(panelData[!complete.cases(panelData),"city_name"]) # list incomplete cities
+zeroPolice <- unique(panelData[panelData$police_city == 0, "city_name"]) # cities with zero police spending
+
+panelData <- panelData[!panelData$city_name %in% incompleteCities, ] # remove incomplete cities
+panelData <- panelData[!panelData$city_name %in% zeroPolice, ] # remove zero police
+length(unique(panelData$city_name)) # 100 cities with complete observations
+```
+
+**Table 2 with the summary statistics is below:**
+
+```{r Summary Stats, results = "asis"}
+library(stargazer)
+
+# Summary Statistics
+
+varList <- c("police_city", "rev_total_city","crime_new_r", "crime_cml_r", "totpop", "viol_r", "prop_r", "black", "college", "unemployed", "poverty", "male1524")
+
+stargazer(panelData[,names(panelData) %in% varList], type = "html", title = "Table 2. Summary Statistics", out = "SumStat2.html",
+          summary.stat = c("n", "mean", "sd", "min", "max"), digits = 2)
+
+```
+
+
+# Panel Regression Model
+
+
+In this section I run a set of 5 regression models. The models gradually become more restrictive as we go from model 1 up to model 5 which has both city and time fixed effects in addition to having the dynamic panel specification. I used the `plm` package for this.
+
+
+The first step is to prep the data for the regression models. I need to do the following:
+
+1. Lag the independent variables by one year using the `data.table` package.
+2. Where appropriate, mean center the independent variables by using z-score standardization.
+3. Create population weights for the regression models, using **1990** as the base year.
+
+```{r Reg Prep}
+library(lmtest)
+library(sandwich)
+library(ivreg)
+library(plm)
+
+panelData <- panelData[,c(1,32,2:31,33:36)]
+
+# Population weights
+
+pop1990 <- panelData[panelData$year == 1990, c(1,4)]
+panelData$pop_weight <- pop1990$totpop[match(panelData$city_name, pop1990$city_name)]
+panelData <- panelData[, c(1:4,37,5:36)]
+
+# Lag by independent var by one year
+library(data.table)
+panelData <- as.data.table(panelData) # convert to data table
+toLagList <- names(panelData)[6:37]
+nm2 <- paste(toLagList, 1, sep="_")
+panelData[, (nm2):=lapply(.SD, function(x) c(NA, x[-.N])), by = city_name, .SDcols = toLagList]
+
+
+# Z Score standardize the lagged variables
+panelData <- as.data.frame(panelData)
+stdNames <- paste(names(panelData)[38:69], "std", sep = "_") # give std suffix to stand variables
+stdPanel <- as.data.frame(apply(panelData[,38:69], 2, function(x) scale(x)))
+names(stdPanel) <- stdNames
+panelData <- cbind(panelData, stdPanel)
+
+```
+
+
+## Run Panel Models
+
+The first step is to set our data as a panel and define the regression formulas. The `plm` package which we used for the dynamic panel model does not yet support regression weights of instrumental variable models, so we instead use the log of total population as a conrtrol variable in our model. 
+
+
+```{r Reg Setup}
+panelData <- pdata.frame(panelData, index = c("city_name", "year"))
+
+regFormula1 <- formula(police_city ~ crime_cml_r_1 + rev_total_city_1 + viol_r_1 + prop_r_1 + log(totpop) + popdens_1 + black_1 + fborn_1 + male1524_1 + college_1 + unemployed_male_1 + poverty_1 |
+iv_cml_r_1 + rev_total_city_1 + viol_r_1 + prop_r_1 + log(totpop) + popdens_1 + black_1 + fborn_1 + male1524_1 + college_1 + unemployed_male_1 + poverty_1) # no year dummy variables, lagged indpdt vars but not standardized
+
+
+regFormula1A <- formula(police_city ~ crime_cml_r_1_std + rev_total_city_1_std + viol_r_1_std + prop_r_1_std + log(totpop) + popdens_1_std + black_1_std + fborn_1_std + male1524_1_std + college_1_std + unemployed_male_1_std + poverty_1_std |
+iv_cml_r_1_std + rev_total_city_1_std + viol_r_1_std + prop_r_1_std + log(totpop) + popdens_1_std + black_1_std + fborn_1_std + male1524_1_std + college_1_std +
+unemployed_male_1_std + poverty_1_std) # no year dummy variables, lagged standardized indpdt vars 
+
+
+regFormula2 <- formula(police_city ~ crime_cml_r_1 + rev_total_city_1 + viol_r_1 + prop_r_1 + log(totpop) + popdens_1 + black_1 + fborn_1 + male1524_1 + college_1 + unemployed_male_1 + poverty_1 + factor(year)|
+iv_cml_r_1 + rev_total_city_1 + viol_r_1 + prop_r_1 + log(totpop) + popdens_1 + black_1 + fborn_1 + male1524_1 + college_1 +
+ unemployed_male_1 + poverty_1 + factor(year)) # year dummy variables, lagged indpdt vars but not standardized
+
+
+regFormula2A <- formula(police_city ~ crime_cml_r_1_std + rev_total_city_1_std + viol_r_1_std + prop_r_1_std + log(totpop) + popdens_1_std + black_1_std + fborn_1_std + male1524_1_std + college_1_std + unemployed_male_1_std + poverty_1_std + factor(year) |
+iv_cml_r_1_std + rev_total_city_1_std + viol_r_1_std + prop_r_1_std + log(totpop) + popdens_1_std + black_1_std + fborn_1_std + male1524_1_std + college_1_std + unemployed_male_1_std + poverty_1_std + factor(year)) # year dummy variables, lagged standardized indpdt vars 
+
+```
+
+The first regression model is a simple instrumental variables regression without city or time fixed effects. The number of environmental and arts charities is used as an instrument for the number of **crime focused non-profits**.
+
+
+```{r Model 1}
+model.fit1 <- ivreg(regFormula1A, data = panelData)
+summary(model.fit1)
+
+# Huber-White standard errors
+model.fit1A <- coeftest(model.fit1, vcovHC(model.fit1, type = "HC0", cluster = "city_name")) 
+
+```
+
+
+The second regression model is a standard panel model (i.e., not a dynamic panel model) which includes city fixed effect but not time fixed effects.
+
+```{r Model 2}
+model.fit2 <- plm(regFormula1A, data = panelData, model = "within")
+summary(model.fit2)
+
+# Huber-White standard errors
+model.fit2A <- coeftest(model.fit2, vcovHC(model.fit2, type = "HC0", cluster = "group"))
+
+```
+
+The third model is a standard panel model (i.e., not a dynamic panel model) which includes time fixed effects only.
+
+```{r Model 3}
+
+model.fit3 <- ivreg(regFormula2A, data = panelData)
+summary(model.fit3)
+
+# Huber-White standard errors
+model.fit3A <- coeftest(model.fit3, vcovHC(model.fit3, type = "HC0", cluster = "city_name"))
+
+```
+
+
+Model 4 includes both city and time fixed effect but it is not a dynamic panel model.
+
+```{r Model 4}
+model.fit4 <- plm(regFormula2A, data = panelData, model = "within")
+summary(model.fit4)
+
+# Huber-White standard errors
+model.fit4A <- coeftest(model.fit4, vcovHC(model.fit4, type = "HC0", cluster = "group"))
+```
+
+
+Model 5 is the full model. It includes a lag of the dependent variable (i.e., is a dynamic panel model) and it has both city and time fixed effects.
+
+```{r Model 5}
+model.fit5 <- pgmm(police_city ~ lag(police_city, 1:2) + crime_cml_r_1_std + rev_total_city_1_std + viol_r_1_std + prop_r_1_std +log(totpop)+ popdens_1_std + black_1_std + fborn_1_std + male1524_1_std + college_1_std + unemployed_male_1_std + poverty_1_std |
+lag(police_city, 2:23) + lag(iv_cml_r_1_std, 0), transformation = "d", effect = "twoways", model = "twosteps", data = panelData)
+
+summary(model.fit5, robust = T)
+
+
+model.fit5A <- coeftest(model.fit5, vcovHC(model.fit5, type = "HC0", cluster = "group"))
+
+```
+
+
+The final step is to create the regression tables using the `stargazer` package.
+
+```{r Reg Table, results = "asis"}
+
+yearList <- as.character(1993:2012) # to remove year dummies from pgmm
+
+colLabels1 <- c("Crime Non-profits", "Total Revenue", "Violent Crime Rate", "Property Crime Rate",
+                "log(Total Population)", "Population Density", "% Black", "% Foreign Born", "% Male",
+                "% College Education", "Male Unemployment Rate", "% In Poverty") # covariate labels for stargazer
+
+colLabels2 <- c("Lag Police Spending 1", "Lag Police Spending 2","Crime Non-profits", "Total Revenue",
+                "Violent Crime Rate", "Property Crime Rate", "log(Total Population)", "Population Density",
+                "% Black", "% Foreign Born", "% Male", "% College Education", "Male Unemployment Rate",
+                "% In Poverty") # covariate labels for stargazer
+
+
+addLines1 <- list(c("N", "2,200", "2,200", "2,200", "2,200", "2,000"))
+addLines2 <- list(c("City FE", "No", "Yes", "No", "Yes", "Yes"))
+addLines3 <- list(c("Time FE", "No", "No", "Yes", "Yes", "Yes"))
+addLines4 <- list(c("Dynamic Panel", "No", "No", "No", "No", "Yes"))
+addLines5 <- list(c("Adj R Squared", "0.50", "0.36", "0.53", "0.40", "-"))
+addLines6 <- list(c("AR(1) test (p-value)", "-", "-", "-", "-", "0.002"))
+addLines7 <- list(c("AR(2) test (p-value)", "-", "-", "-", "-", "0.066"))
+addLines8 <- list(c("Hansen test of over-identification (p-value)", "-", "-", "-", "-", "1.00"))
+
+
+stargazer(model.fit1A, model.fit2A, model.fit3A, model.fit4A, model.fit5A, title = "Effect of Crime Focused Non-profits on Police Spending", digits = 2, no.space = T, dep.var.caption = "Police Spending ($/resident)", 
+keep.stat = c("all", "adj.rsq", "wald"), type = "html", out = "Regression Models.html", omit = c("year", yearList),
+covariate.labels = c(colLabels2), add.lines = c(addLines1, addLines2, addLines3, addLines4, addLines5, addLines6,
+                                                addLines7, addLines8))
+
+```
+
+
+The explanation of the results can be seen on Page 13 of the Econometrics section of the full paper.
